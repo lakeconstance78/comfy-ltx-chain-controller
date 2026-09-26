@@ -290,7 +290,17 @@ class LTXResolutionSelector:
 
     def select(self, resolution, window_frames, fps):
         width, height = LTX_RESOLUTION_TABLE[resolution]
-        return (int(width), int(height), int(window_frames), int(fps))
+        # The LTX pipeline can only render video lengths of 8k + 1 frames
+        # and pads other windows up (300 -> 305). Block 1 is rendered with
+        # this raw value, so it must be snapped here as well - otherwise
+        # block 1 ends up longer than the chain math assumes and the audio
+        # desynchronizes at the very first block boundary.
+        _k = round((int(window_frames) - 1) / 8)
+        wf_eff = max(9, int(_k) * 8 + 1)
+        if wf_eff != int(window_frames):
+            print(f"[LTXResolutionSelector] window_frames={window_frames} "
+                  f"not representable (valid: 8k+1) -> {wf_eff}.")
+        return (int(width), int(height), wf_eff, int(fps))
 
 
 # ---- The node ----
@@ -377,8 +387,8 @@ class LTXChainController:
             vf = pathlib.Path(cands[-1])
             if vf.stat().st_size == 0:
                 print(f"[ChainController] WARNING: {vf.name} is 0 bytes and "
-                      f"will be skipped (probably a leftover from an "
-                      f"aborted run).")
+                    f"will be skipped (probably a leftover from an "
+                    f"aborted run).")
                 continue
             vids.append(vf)
             print(f"[ChainController]   concat input: {vf.name} "
@@ -413,8 +423,8 @@ class LTXChainController:
             )
             if normalize and target:
                 print(f"[ChainController] WARNING: block videos will be "
-                      f"scaled/padded uniformly to {target[0]}x{target[1]} "
-                      f"for the final concat.")
+                    f"scaled/padded uniformly to {target[0]}x{target[1]} "
+                    f"for the final concat.")
 
         song = ""
         try:
@@ -448,7 +458,7 @@ class LTXChainController:
                 lines = (proc.stderr or proc.stdout or "").strip().splitlines()
                 tail = "\n".join(lines[-15:]) if lines else "(no output)"
                 print(f"[ChainController] ffmpeg {label} FAILED "
-                      f"(exit {proc.returncode}):\n{tail}")
+                    f"(exit {proc.returncode}):\n{tail}")
             return proc
 
         inputs = []
@@ -458,11 +468,10 @@ class LTXChainController:
             inputs += ["-i", str(vf)]
 
             # Keep block 1 entirely. From block 2 on, remove the overlapping
-            # first frame - frame-exact via start_frame=1. The old time-based
-            # trim=start=1/fps depended on float rounding and the input
-            # timebase and could drop one frame too many or too few per
-            # boundary, which desynchronizes the video from the song
-            # cumulatively.
+            # first frame - frame-exact via start_frame=1. This trim is
+            # REQUIRED for audio sync (the chain math assumes one shared
+            # frame per boundary), the stutter fix comes from the re-stamp
+            # after the concat, not from removing the trim.
             chain = []
             if i > 0:
                 chain.append("trim=start_frame=1")
@@ -475,18 +484,21 @@ class LTXChainController:
                     f"force_original_aspect_ratio=decrease",
                     f"pad={target[0]}:{target[1]}:(ow-iw)/2:(oh-ih)/2",
                 ]
-            # Re-stamp every block onto a clean constant-frame-rate grid
-            # with a common time base. This heals VFR jitter from the
-            # encoder so the drift cannot accumulate across boundaries.
-            chain.append(f"fps={fps:g}")
+            # Common time base for all concat inputs.
             chain.append("settb=AVTB")
-            filter_parts.append(
-                f"[{i}:v]" + ",".join(chain) + f"[v{i}]"
-            )
+            filter_parts.append(f"[{i}:v]" + ",".join(chain) + f"[v{i}]")
 
         concat_inputs = "".join(f"[v{i}]" for i in range(len(vids)))
+        # Re-stamp the WHOLE concatenated stream onto a perfectly uniform
+        # frame grid (frame N -> exactly N/fps seconds). This is the exact
+        # trick from the verified manual test concat and removes the
+        # boundary jitter the raw block timestamps carry over. The
+        # per-block 'fps=' filter is deliberately NOT used: it can
+        # duplicate a frame on timing jitter, which itself shows as a
+        # stutter.
         filter_parts.append(
-            f"{concat_inputs}concat=n={len(vids)}:v=1:a=0[vout]"
+            f"{concat_inputs}concat=n={len(vids)}:v=1:a=0,"
+            f"setpts=N/{fps:g}/TB[vout]"
         )
 
         cmd = [FFMPEG, "-y", "-loglevel", "error", *inputs]
@@ -508,6 +520,7 @@ class LTXChainController:
 
         cmd += [
             "-c:v", "libx264",
+            "-r", f"{fps:g}",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             str(final),
@@ -571,6 +584,20 @@ class LTXChainController:
             _cleanup_artifacts(out, inp, subfolder)
             return ()
 
+        # ---- Snap window to a length the LTX pipeline can render ----
+        # The causal VAE only represents video lengths of 8k + 1 frames and
+        # pads shorter windows up (300 -> 305, 240 -> 241). The extra frames
+        # desynchronized audio cumulatively at every block boundary. Snapping
+        # the window to the nearest representable value makes the rendered
+        # block length match the timeline math exactly.
+        _k = round((window_frames - 1) / 8)
+        wf_eff = max(9, int(_k) * 8 + 1)
+        if wf_eff != window_frames:
+            print(f"[ChainController] window_frames={window_frames} ist fuer "
+                  f"die LTX-Pipeline not representable (valid: 8k+1) - "
+                  f"block window adjusted to {wf_eff}.")
+        window_frames = wf_eff
+
         if total_blocks == 0:
             total_blocks = math.ceil(total_frames / window_frames)
             print(f"[ChainController] Auto: {total_blocks} blocks from "
@@ -627,10 +654,18 @@ class LTXChainController:
                   f"{prev_latent.stat().st_size / 1024:7.1f} KB")
 
         ni = block_index + 1  # 0-based index of the NEXT block
-        if ni >= total_blocks:
-            print(f"[ChainController] All {total_blocks} blocks finished.")
+        # Start frame the NEXT block would get. If it already lies beyond
+        # the last frame (e.g. total_blocks set far too high), stop here
+        # instead of queueing a block with a negative duration.
+        s_next = (ni * window_frames) - ni
+        if ni >= total_blocks or s_next >= total_frames:
+            print(f"[ChainController] Chain finished after block {b} "
+                  f"(last frame {total_frames} reached).")
             if auto_concat:
-                self._concat(out, inp, subfolder, prompt, total_blocks)
+                # Use the REAL number of finished blocks (b), not
+                # total_blocks - a wrong total_blocks value would spam
+                # the concat with thousands of 'no video found' warnings.
+                self._concat(out, inp, subfolder, prompt, b)
             return ()
 
         # 3) Build the prompt for the next block
@@ -703,7 +738,7 @@ class LTXChainController:
                 key_png = f"block_{b}_last.png"
 
         tl_str, loc, segl = _build_timeline(d["timeline_data"], s, e,
-                    key_png, subfolder, keyframe_len)
+                                            key_png, subfolder, keyframe_len)
         d.update(start_frame=s, end_frame=e, duration_frames=e - s,
                  start_second=round(s / 24, 3), end_second=round(e / 24, 3),
                  duration_seconds=round((e - s) / 24, 3),
